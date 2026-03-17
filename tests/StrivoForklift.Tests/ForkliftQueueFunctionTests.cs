@@ -1,33 +1,35 @@
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Logging.Abstractions;
-using StrivoForklift.Data;
-using StrivoForklift.Models;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace StrivoForklift.Tests;
 
+/// <summary>
+/// Minimal ILogger implementation that captures log entries so tests can assert on them.
+/// </summary>
+internal sealed class CapturingLogger<T> : ILogger<T>
+{
+    public readonly List<(LogLevel Level, string Message)> Entries = [];
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state,
+        Exception? exception, Func<TState, Exception?, string> formatter)
+        => Entries.Add((logLevel, formatter(state, exception)));
+}
+
 public class ForkliftQueueFunctionTests
 {
-    private static ForkliftDbContext CreateInMemoryDbContext(string dbName)
-    {
-        var options = new DbContextOptionsBuilder<ForkliftDbContext>()
-            .UseInMemoryDatabase(databaseName: dbName)
-            .Options;
-        var context = new ForkliftDbContext(options);
-        context.Database.EnsureCreated();
-        return context;
-    }
-
     /// <summary>Builds a valid 3-line raw queue message string.</summary>
     private static string BuildRawMessage(Guid transactionId, string source, string accountId, string message, string timestamp)
         => $"{transactionId}\n{{\"source\":\"{source}\",\"Id\":\"{accountId}\",\"Message\":\"{message}\"}}\n{timestamp}";
 
     [Fact]
-    public async Task Run_NewMessage_InsertsRecord()
+    public async Task Run_ValidMessage_LogsDequeueDetails()
     {
         // Arrange
-        using var db = CreateInMemoryDbContext(nameof(Run_NewMessage_InsertsRecord));
-        var function = new ForkliftQueueFunction(db, NullLogger<ForkliftQueueFunction>.Instance);
+        var logger = new CapturingLogger<ForkliftQueueFunction>();
+        var function = new ForkliftQueueFunction(logger);
         var guid = Guid.NewGuid();
         var rawMessage = BuildRawMessage(guid, "fake_bank_transactions_1000.csv", "tx0001",
             "Direct debit SEK 97.77 (Internet subscription)", "3/17/2026, 12:42:55 PM");
@@ -35,40 +37,19 @@ public class ForkliftQueueFunctionTests
         // Act
         await function.Run(rawMessage);
 
-        // Assert
-        var stored = await db.Transactions.FindAsync(guid);
-        Assert.NotNull(stored);
-        Assert.Equal(guid, stored.TransactionId);
-        Assert.Equal("tx0001", stored.AccountId);
-        Assert.Equal("fake_bank_transactions_1000.csv", stored.Source);
-        Assert.Equal("Direct debit SEK 97.77 (Internet subscription)", stored.Message);
-        Assert.NotNull(stored.EventTs);
-        Assert.NotNull(stored.OriginalJson);
+        // Assert – a dequeue log entry containing the transaction id must exist
+        Assert.Contains(logger.Entries,
+            e => e.Level == LogLevel.Information && e.Message.Contains(guid.ToString()));
+        // No warnings should have been emitted for a well-formed message
+        Assert.DoesNotContain(logger.Entries, e => e.Level == LogLevel.Warning);
     }
 
     [Fact]
-    public async Task Run_DuplicateTransactionId_IsSkipped()
+    public async Task Run_MultipleDistinctMessages_EachLogged()
     {
         // Arrange
-        using var db = CreateInMemoryDbContext(nameof(Run_DuplicateTransactionId_IsSkipped));
-        var function = new ForkliftQueueFunction(db, NullLogger<ForkliftQueueFunction>.Instance);
-        var guid = Guid.NewGuid();
-        var rawMessage = BuildRawMessage(guid, "test.csv", "tx0001", "Payment A", "3/17/2026, 12:42:55 PM");
-
-        // Act – send the same GUID twice
-        await function.Run(rawMessage);
-        await function.Run(rawMessage);
-
-        // Assert – only one record should exist
-        Assert.Equal(1, await db.Transactions.CountAsync());
-    }
-
-    [Fact]
-    public async Task Run_MultipleDistinctTransactions_StoredSeparately()
-    {
-        // Arrange
-        using var db = CreateInMemoryDbContext(nameof(Run_MultipleDistinctTransactions_StoredSeparately));
-        var function = new ForkliftQueueFunction(db, NullLogger<ForkliftQueueFunction>.Instance);
+        var logger = new CapturingLogger<ForkliftQueueFunction>();
+        var function = new ForkliftQueueFunction(logger);
         var guid1 = Guid.NewGuid();
         var guid2 = Guid.NewGuid();
 
@@ -76,42 +57,62 @@ public class ForkliftQueueFunctionTests
         await function.Run(BuildRawMessage(guid1, "test.csv", "tx0001", "Payment A", "3/17/2026, 12:42:55 PM"));
         await function.Run(BuildRawMessage(guid2, "test.csv", "tx0002", "Payment B", "3/17/2026, 1:00:00 PM"));
 
-        // Assert
-        Assert.Equal(2, await db.Transactions.CountAsync());
-        var stored1 = await db.Transactions.FindAsync(guid1);
-        var stored2 = await db.Transactions.FindAsync(guid2);
-        Assert.NotNull(stored1);
-        Assert.NotNull(stored2);
-        Assert.Equal("tx0001", stored1.AccountId);
-        Assert.Equal("tx0002", stored2.AccountId);
+        // Assert – both transaction ids appear in log output
+        Assert.Contains(logger.Entries,
+            e => e.Level == LogLevel.Information && e.Message.Contains(guid1.ToString()));
+        Assert.Contains(logger.Entries,
+            e => e.Level == LogLevel.Information && e.Message.Contains(guid2.ToString()));
     }
 
     [Fact]
-    public async Task Run_MalformedMessage_IsSkipped()
+    public async Task Run_DuplicateTransactionId_BothLogged()
+    {
+        // Arrange – with DB ops disabled, the same message is simply logged twice
+        var logger = new CapturingLogger<ForkliftQueueFunction>();
+        var function = new ForkliftQueueFunction(logger);
+        var guid = Guid.NewGuid();
+        var rawMessage = BuildRawMessage(guid, "test.csv", "tx0001", "Payment A", "3/17/2026, 12:42:55 PM");
+
+        // Act – send the same GUID twice
+        await function.Run(rawMessage);
+        await function.Run(rawMessage);
+
+        // Assert – the dequeue detail log (the structured "Dequeued message —" line) appears once per invocation
+        var detailLogs = logger.Entries
+            .Where(e => e.Level == LogLevel.Information && e.Message.StartsWith("Dequeued message"))
+            .ToList();
+        Assert.Equal(2, detailLogs.Count);
+    }
+
+    [Fact]
+    public async Task Run_MalformedMessage_LogsWarningAndSkips()
     {
         // Arrange
-        using var db = CreateInMemoryDbContext(nameof(Run_MalformedMessage_IsSkipped));
-        var function = new ForkliftQueueFunction(db, NullLogger<ForkliftQueueFunction>.Instance);
+        var logger = new CapturingLogger<ForkliftQueueFunction>();
+        var function = new ForkliftQueueFunction(logger);
 
         // Act – only 1 line, not 3
         await function.Run("only-one-line");
 
-        // Assert – nothing should be inserted
-        Assert.Equal(0, await db.Transactions.CountAsync());
+        // Assert – a warning is logged and no informational dequeue entry is present
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning);
+        Assert.DoesNotContain(logger.Entries,
+            e => e.Level == LogLevel.Information && e.Message.Contains("Dequeued message"));
     }
 
     [Fact]
-    public async Task Run_InvalidGuid_IsSkipped()
+    public async Task Run_InvalidGuid_LogsWarningAndSkips()
     {
         // Arrange
-        using var db = CreateInMemoryDbContext(nameof(Run_InvalidGuid_IsSkipped));
-        var function = new ForkliftQueueFunction(db, NullLogger<ForkliftQueueFunction>.Instance);
+        var logger = new CapturingLogger<ForkliftQueueFunction>();
+        var function = new ForkliftQueueFunction(logger);
         var rawMessage = "not-a-guid\n{\"source\":\"test.csv\",\"Id\":\"tx0001\",\"Message\":\"Payment\"}\n3/17/2026, 12:42:55 PM";
 
         // Act
         await function.Run(rawMessage);
 
         // Assert
-        Assert.Equal(0, await db.Transactions.CountAsync());
+        Assert.Contains(logger.Entries,
+            e => e.Level == LogLevel.Warning && e.Message.Contains("not-a-guid"));
     }
 }

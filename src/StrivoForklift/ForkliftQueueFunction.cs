@@ -2,7 +2,7 @@ using System.Globalization;
 using System.Text.Json;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
-using StrivoForklift.Data;
+// using StrivoForklift.Data;
 using StrivoForklift.Models;
 
 namespace StrivoForklift;
@@ -14,15 +14,17 @@ namespace StrivoForklift;
 ///   Line 2 – JSON body with source, Id, and Message fields
 ///   Line 3 – event timestamp (e.g. "3/17/2026, 12:42:55 PM")
 /// Transactions are inserted on first receipt; duplicate GUIDs are silently skipped.
+/// NOTE: Database operations are temporarily commented out to isolate and verify
+/// queue ingestion. Re-enable when database connectivity is confirmed.
 /// </summary>
 public class ForkliftQueueFunction
 {
-    private readonly ForkliftDbContext _dbContext;
+    // private readonly ForkliftDbContext _dbContext;
     private readonly ILogger<ForkliftQueueFunction> _logger;
 
-    public ForkliftQueueFunction(ForkliftDbContext dbContext, ILogger<ForkliftQueueFunction> logger)
+    public ForkliftQueueFunction(/* ForkliftDbContext dbContext, */ ILogger<ForkliftQueueFunction> logger)
     {
-        _dbContext = dbContext;
+        // _dbContext = dbContext;
         _logger = logger;
     }
 
@@ -30,6 +32,8 @@ public class ForkliftQueueFunction
     public async Task Run(
         [QueueTrigger("consumethis", Connection = "StorageQueue")] string rawMessage)
     {
+        _logger.LogInformation("Dequeued raw message: {RawMessage}", rawMessage);
+
         var lines = rawMessage.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (lines.Length < 3)
         {
@@ -76,28 +80,32 @@ public class ForkliftQueueFunction
         }
 
         _logger.LogInformation(
-            "Processing transaction Id: {TransactionId}, AccountId: {AccountId}",
-            transactionId, payload.Id);
+            "Dequeued message — TransactionId: {TransactionId}, AccountId: {AccountId}, Source: {Source}, Message: {Message}, EventTs: {EventTs}",
+            transactionId, payload.Id, payload.Source, payload.Message, eventTs?.ToString("o") ?? "(unparsed)");
 
-        var existing = await _dbContext.Transactions.FindAsync(transactionId);
-        if (existing is not null)
-        {
-            _logger.LogInformation("Skipped duplicate transaction Id: {TransactionId}", transactionId);
-            return;
-        }
+        // ── Database operations commented out for queue-ingestion diagnostics ──────────
+        // var existing = await _dbContext.Transactions.FindAsync(transactionId);
+        // if (existing is not null)
+        // {
+        //     _logger.LogInformation("Skipped duplicate transaction Id: {TransactionId}", transactionId);
+        //     return;
+        // }
+        //
+        // _dbContext.Transactions.Add(new Transaction
+        // {
+        //     TransactionId = transactionId,
+        //     AccountId = payload.Id,
+        //     Source = payload.Source,
+        //     Message = payload.Message,
+        //     EventTs = eventTs,
+        //     OriginalJson = jsonLine,
+        //     InsertionTime = DateTime.UtcNow
+        // });
+        // await _dbContext.SaveChangesAsync();
+        //
+        // _logger.LogInformation("Inserted transaction Id: {TransactionId}", transactionId);
+        // ──────────────────────────────────────────────────────────────────────────────
 
-        _dbContext.Transactions.Add(new Transaction
-        {
-            TransactionId = transactionId,
-            AccountId = payload.Id,
-            Source = payload.Source,
-            Message = payload.Message,
-            EventTs = eventTs,
-            OriginalJson = jsonLine,
-            InsertionTime = DateTime.UtcNow
-        });
-        await _dbContext.SaveChangesAsync();
-
-        _logger.LogInformation("Inserted transaction Id: {TransactionId}", transactionId);
+        await Task.CompletedTask;
     }
 }
