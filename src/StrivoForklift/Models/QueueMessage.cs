@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 namespace StrivoForklift.Models;
 
 /// <summary>
-/// Represents the JSON payload embedded in a bank transaction queue message.
+/// Represents the JSON payload of a bank transaction queue message.
 /// </summary>
 public class QueueMessage
 {

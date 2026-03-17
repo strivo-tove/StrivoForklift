@@ -6,7 +6,7 @@ namespace StrivoForklift.Models;
 /// </summary>
 public class Transaction
 {
-    /// <summary>Unique identifier for the transaction (primary key, GUID parsed from the queue message).</summary>
+    /// <summary>Unique identifier for the transaction (primary key, GUID generated at ingestion time).</summary>
     public Guid TransactionId { get; set; }
 
     /// <summary>Account identifier from the JSON payload (JSON $.Id, not unique).</summary>
@@ -18,7 +18,7 @@ public class Transaction
     /// <summary>Human-readable transaction description (JSON $.Message).</summary>
     public string? Message { get; set; }
 
-    /// <summary>Timestamp of the event, parsed from the third line of the queue message.</summary>
+    /// <summary>Timestamp of the event; not present in the current queue message format, reserved for future use.</summary>
     public DateTime? EventTs { get; set; }
 
     /// <summary>The original JSON payload from the queue message.</summary>

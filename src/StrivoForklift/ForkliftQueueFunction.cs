@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Text.Json;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
@@ -9,11 +8,9 @@ namespace StrivoForklift;
 
 /// <summary>
 /// Azure Function triggered by messages on the "consumethis" Azure Storage Queue.
-/// Each message is a three-line text payload:
-///   Line 1 – transaction GUID (maps to transaction_id)
-///   Line 2 – JSON body with source, Id, and Message fields
-///   Line 3 – event timestamp (e.g. "3/17/2026, 12:42:55 PM")
-/// Transactions are inserted on first receipt; duplicate GUIDs are silently skipped.
+/// Each message is a JSON payload with source, Id, and Message fields, e.g.:
+///   {"source":"fake_bank_transactions_1000.csv","Id":"tx0001","Message":"..."}
+/// A transaction GUID is generated at ingestion time and stored as the primary key.
 /// NOTE: Database operations are temporarily commented out to isolate and verify
 /// queue ingestion. Re-enable when database connectivity is confirmed.
 /// </summary>
@@ -34,30 +31,14 @@ public class ForkliftQueueFunction
     {
         _logger.LogInformation("Dequeued raw message: {RawMessage}", rawMessage);
 
-        var lines = rawMessage.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (lines.Length < 3)
-        {
-            _logger.LogWarning(
-                "Received malformed queue message; expected 3 lines but got {Count}. Message skipped.",
-                lines.Length);
-            return;
-        }
-
-        if (!Guid.TryParse(lines[0], out var transactionId))
-        {
-            _logger.LogWarning("Failed to parse transaction GUID from: {Line}", lines[0]);
-            return;
-        }
-
-        var jsonLine = lines[1];
         QueueMessage? payload;
         try
         {
-            payload = JsonSerializer.Deserialize<QueueMessage>(jsonLine);
+            payload = JsonSerializer.Deserialize<QueueMessage>(rawMessage);
         }
         catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "Failed to deserialize JSON payload: {Json}", jsonLine);
+            _logger.LogWarning(ex, "Failed to deserialize JSON payload: {Json}", rawMessage);
             return;
         }
 
@@ -67,21 +48,10 @@ public class ForkliftQueueFunction
             return;
         }
 
-        DateTime? eventTs = null;
-        // Expected timestamp format matches the queue message format: "M/d/yyyy, h:mm:ss tt" (e.g. "3/17/2026, 12:42:55 PM")
-        if (DateTime.TryParseExact(lines[2], "M/d/yyyy, h:mm:ss tt",
-                CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsedTs))
-        {
-            eventTs = parsedTs;
-        }
-        else
-        {
-            _logger.LogWarning("Could not parse event timestamp from: {Line}", lines[2]);
-        }
-
+        var transactionId = Guid.NewGuid();
         _logger.LogInformation(
-            "Dequeued message — TransactionId: {TransactionId}, AccountId: {AccountId}, Source: {Source}, Message: {Message}, EventTs: {EventTs}",
-            transactionId, payload.Id, payload.Source, payload.Message, eventTs?.ToString("o") ?? "(unparsed)");
+            "Dequeued message — TransactionId: {TransactionId}, AccountId: {AccountId}, Source: {Source}, Message: {Message}",
+            transactionId, payload.Id, payload.Source, payload.Message);
 
         // ── Database operations commented out for queue-ingestion diagnostics ──────────
         // var existing = await _dbContext.Transactions.FindAsync(transactionId);
@@ -97,8 +67,7 @@ public class ForkliftQueueFunction
         //     AccountId = payload.Id,
         //     Source = payload.Source,
         //     Message = payload.Message,
-        //     EventTs = eventTs,
-        //     OriginalJson = jsonLine,
+        //     OriginalJson = rawMessage,
         //     InsertionTime = DateTime.UtcNow
         // });
         // await _dbContext.SaveChangesAsync();

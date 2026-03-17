@@ -20,9 +20,9 @@ internal sealed class CapturingLogger<T> : ILogger<T>
 
 public class ForkliftQueueFunctionTests
 {
-    /// <summary>Builds a valid 3-line raw queue message string.</summary>
-    private static string BuildRawMessage(Guid transactionId, string source, string accountId, string message, string timestamp)
-        => $"{transactionId}\n{{\"source\":\"{source}\",\"Id\":\"{accountId}\",\"Message\":\"{message}\"}}\n{timestamp}";
+    /// <summary>Builds a raw queue message string in the JSON format used by the queue.</summary>
+    private static string BuildRawMessage(string source, string accountId, string message)
+        => $"{{\"source\":\"{source}\",\"Id\":\"{accountId}\",\"Message\":\"{message}\"}}";
 
     [Fact]
     public async Task Run_ValidMessage_LogsDequeueDetails()
@@ -30,16 +30,15 @@ public class ForkliftQueueFunctionTests
         // Arrange
         var logger = new CapturingLogger<ForkliftQueueFunction>();
         var function = new ForkliftQueueFunction(logger);
-        var guid = Guid.NewGuid();
-        var rawMessage = BuildRawMessage(guid, "fake_bank_transactions_1000.csv", "tx0001",
-            "Direct debit SEK 97.77 (Internet subscription)", "3/17/2026, 12:42:55 PM");
+        var rawMessage = BuildRawMessage("fake_bank_transactions_1000.csv", "tx0001",
+            "Direct debit SEK 97.77 (Internet subscription)");
 
         // Act
         await function.Run(rawMessage);
 
-        // Assert – a dequeue log entry containing the transaction id must exist
+        // Assert – a dequeue log entry containing the account id must exist
         Assert.Contains(logger.Entries,
-            e => e.Level == LogLevel.Information && e.Message.Contains(guid.ToString()));
+            e => e.Level == LogLevel.Information && e.Message.Contains("tx0001"));
         // No warnings should have been emitted for a well-formed message
         Assert.DoesNotContain(logger.Entries, e => e.Level == LogLevel.Warning);
     }
@@ -50,30 +49,27 @@ public class ForkliftQueueFunctionTests
         // Arrange
         var logger = new CapturingLogger<ForkliftQueueFunction>();
         var function = new ForkliftQueueFunction(logger);
-        var guid1 = Guid.NewGuid();
-        var guid2 = Guid.NewGuid();
 
         // Act
-        await function.Run(BuildRawMessage(guid1, "test.csv", "tx0001", "Payment A", "3/17/2026, 12:42:55 PM"));
-        await function.Run(BuildRawMessage(guid2, "test.csv", "tx0002", "Payment B", "3/17/2026, 1:00:00 PM"));
+        await function.Run(BuildRawMessage("test.csv", "tx0001", "Payment A"));
+        await function.Run(BuildRawMessage("test.csv", "tx0002", "Payment B"));
 
-        // Assert – both transaction ids appear in log output
+        // Assert – both account ids appear in log output
         Assert.Contains(logger.Entries,
-            e => e.Level == LogLevel.Information && e.Message.Contains(guid1.ToString()));
+            e => e.Level == LogLevel.Information && e.Message.Contains("tx0001"));
         Assert.Contains(logger.Entries,
-            e => e.Level == LogLevel.Information && e.Message.Contains(guid2.ToString()));
+            e => e.Level == LogLevel.Information && e.Message.Contains("tx0002"));
     }
 
     [Fact]
-    public async Task Run_DuplicateTransactionId_BothLogged()
+    public async Task Run_SameMessageTwice_BothLogged()
     {
-        // Arrange – with DB ops disabled, the same message is simply logged twice
+        // Arrange – with DB ops disabled, the same message is simply logged twice; each invocation gets a unique TransactionId
         var logger = new CapturingLogger<ForkliftQueueFunction>();
         var function = new ForkliftQueueFunction(logger);
-        var guid = Guid.NewGuid();
-        var rawMessage = BuildRawMessage(guid, "test.csv", "tx0001", "Payment A", "3/17/2026, 12:42:55 PM");
+        var rawMessage = BuildRawMessage("test.csv", "tx0001", "Payment A");
 
-        // Act – send the same GUID twice
+        // Act – send the same message twice
         await function.Run(rawMessage);
         await function.Run(rawMessage);
 
@@ -91,8 +87,8 @@ public class ForkliftQueueFunctionTests
         var logger = new CapturingLogger<ForkliftQueueFunction>();
         var function = new ForkliftQueueFunction(logger);
 
-        // Act – only 1 line, not 3
-        await function.Run("only-one-line");
+        // Act – plain text, not valid JSON
+        await function.Run("not-valid-json");
 
         // Assert – a warning is logged and no informational dequeue entry is present
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning);
@@ -101,18 +97,21 @@ public class ForkliftQueueFunctionTests
     }
 
     [Fact]
-    public async Task Run_InvalidGuid_LogsWarningAndSkips()
+    public async Task Run_RealWorldMessage_LogsAccountIdAndSource()
     {
-        // Arrange
+        // Arrange – message format matching actual queue output from the problem statement
         var logger = new CapturingLogger<ForkliftQueueFunction>();
         var function = new ForkliftQueueFunction(logger);
-        var rawMessage = "not-a-guid\n{\"source\":\"test.csv\",\"Id\":\"tx0001\",\"Message\":\"Payment\"}\n3/17/2026, 12:42:55 PM";
+        const string rawMessage = "{\"source\":\"fake_bank_transactions_1000.csv\",\"Id\":\"tx0494\",\"Message\":\"Refund SEK 4773.50 from SJ\"}";
 
         // Act
         await function.Run(rawMessage);
 
         // Assert
         Assert.Contains(logger.Entries,
-            e => e.Level == LogLevel.Warning && e.Message.Contains("not-a-guid"));
+            e => e.Level == LogLevel.Information && e.Message.Contains("tx0494"));
+        Assert.Contains(logger.Entries,
+            e => e.Level == LogLevel.Information && e.Message.Contains("fake_bank_transactions_1000.csv"));
+        Assert.DoesNotContain(logger.Entries, e => e.Level == LogLevel.Warning);
     }
 }
